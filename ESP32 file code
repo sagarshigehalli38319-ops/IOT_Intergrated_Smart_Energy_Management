@@ -1,0 +1,185 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <DHT.h>
+#include <PZEM004Tv30.h>
+
+// Provide the token generation process info.
+#include "addons/TokenHelper.h"
+// Provide the RTDB payload printing info and other helper functions.
+#include "addons/RTDBHelper.h"
+
+// ==========================================
+// 1. YOUR WIFI CREDENTIALS
+// ==========================================
+#define WIFI_SSID "Sagar's S24"
+#define WIFI_PASSWORD "12345678"
+
+// ==========================================
+// 2. YOUR FIREBASE CREDENTIALS
+// ==========================================
+#define API_KEY "AIzaSyB-7v1pu6RElxzcu7eu83i7aMipVQblkfo"
+#define DATABASE_URL "https://iot-energy-hub-default-rtdb.firebaseio.com" 
+
+// ==========================================
+// HARDWARE PINS
+// ==========================================
+#define PIR_PIN 13
+#define RELAY_PIN 26
+#define DHTPIN 14
+#define DHTTYPE DHT22
+#define RXD2 16
+#define TXD2 17
+
+// Hardware Objects
+DHT dht(DHTPIN, DHTTYPE);
+PZEM004Tv30 pzem(Serial2, RXD2, TXD2);
+
+// Firebase Objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Timing & State Variables
+unsigned long lastMotionTime = 0;
+const unsigned long relayOffDelay = 7000; // 7 seconds
+unsigned long sendDataPrevMillis = 0;
+bool signupOK = false;
+
+// Cloud Command Variables
+bool manualOverride = false;
+bool manualRelayState = false;
+bool simulateSpike = false;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize Hardware
+  pinMode(PIR_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // Active-Low Relay: HIGH = OFF initially
+  dht.begin();
+
+  Serial.println("\n==================================");
+  Serial.println(" SMART ENERGY MANAGEMENT SYSTEM ");
+  Serial.println("==================================");
+
+  // Connect to Wi-Fi
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nWi-Fi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // Sign up anonymously (Test mode)
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase Auth Successful");
+    signupOK = true;
+  } else {
+    Serial.printf("%s\n", config.signer.signupError.message.c_str());
+  }
+
+  // Assign the callback function for the long running token generation task
+  config.token_status_callback = tokenStatusCallback; 
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+  // ---------- 1. READ HARDWARE SENSORS ----------
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  float voltage = pzem.voltage();
+  float current = pzem.current();
+  float power   = pzem.power();
+  float energy  = pzem.energy();
+  
+  int motion = digitalRead(PIR_PIN);
+
+  // Apply Dummy Voltage Spike (if commanded by App)
+  if (simulateSpike) {
+    voltage = 300.0; 
+  }
+
+  // ---------- 2. SAFETY CHECK ----------
+  bool safetyCutoff = false;
+  // If Temp > 30C or Voltage is dangerously high (>= 250V)
+  if (temperature > 30.0 || voltage >= 250.0) {
+    safetyCutoff = true;
+  }
+
+  // ---------- 3. RELAY CONTROL LOGIC ----------
+  if (safetyCutoff) {
+    // CRITICAL SAFETY: Turn off instantly, ignore all other inputs
+    digitalWrite(RELAY_PIN, HIGH); // Active-Low: HIGH is OFF
+  } 
+  else if (manualOverride) {
+    // APP CONTROL: Obey the manual switch from Firebase, ignore PIR
+    if (manualRelayState) {
+      digitalWrite(RELAY_PIN, LOW);  // ON
+    } else {
+      digitalWrite(RELAY_PIN, HIGH); // OFF
+    }
+  } 
+  else {
+    // AUTO CONTROL: PIR Sensor
+    if (motion == HIGH) {
+      lastMotionTime = millis();
+      digitalWrite(RELAY_PIN, LOW);   // ON
+    }
+    
+    if (millis() - lastMotionTime > relayOffDelay) {
+      digitalWrite(RELAY_PIN, HIGH);  // OFF after 7 sec
+    }
+  }
+
+  bool isRelayOn = (digitalRead(RELAY_PIN) == LOW);
+
+  // ---------- 4. FIREBASE SYNC (Every 2 seconds) ----------
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 2000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+    
+    // --- A. Fetch Commands from App ---
+    if (Firebase.RTDB.getBool(&fbdo, "IoT_Hub/commands/manual_override")) {
+      manualOverride = fbdo.boolData();
+    }
+    if (Firebase.RTDB.getBool(&fbdo, "IoT_Hub/commands/manual_relay_state")) {
+      manualRelayState = fbdo.boolData();
+    }
+    if (Firebase.RTDB.getBool(&fbdo, "IoT_Hub/commands/simulate_voltage_spike")) {
+      simulateSpike = fbdo.boolData();
+    }
+
+    // --- B. Upload Sensor Data ---
+    if (!isnan(temperature)) Firebase.RTDB.setFloat(&fbdo, "IoT_Hub/sensor_data/temperature", temperature);
+    if (!isnan(humidity)) Firebase.RTDB.setFloat(&fbdo, "IoT_Hub/sensor_data/humidity", humidity);
+    
+    if (!isnan(voltage)) {
+      Firebase.RTDB.setFloat(&fbdo, "IoT_Hub/sensor_data/voltage", voltage);
+      Firebase.RTDB.setFloat(&fbdo, "IoT_Hub/sensor_data/current", current);
+      Firebase.RTDB.setFloat(&fbdo, "IoT_Hub/sensor_data/power", power);
+      Firebase.RTDB.setFloat(&fbdo, "IoT_Hub/sensor_data/energy", energy);
+    }
+
+    // Send Statuses to UI
+    Firebase.RTDB.setBool(&fbdo, "IoT_Hub/sensor_data/motion", (motion == HIGH));
+    Firebase.RTDB.setBool(&fbdo, "IoT_Hub/status/relayState", isRelayOn);
+    Firebase.RTDB.setBool(&fbdo, "IoT_Hub/status/safetyCutoff", safetyCutoff);
+    
+    Serial.println("\n--- Sync Complete ---");
+    if (safetyCutoff) Serial.println("WARNING: SAFETY CUTOFF ACTIVE!");
+    else if (manualOverride) Serial.println("MODE: MANUAL (App Controlled)");
+    else Serial.println("MODE: AUTO (PIR Controlled)");
+    
+    Serial.print("Relay is: "); Serial.println(isRelayOn ? "ON" : "OFF");
+  }
+}
